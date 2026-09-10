@@ -1,0 +1,14 @@
+[Unit]
+Description=hearth llama.cpp — Qwen3.5-4B Q4_K_M
+After=network.target
+
+[Service]
+Type=simple
+Environment=GGML_CUDA_NO_PINNED=1
+ExecStart=@LLAMA_DIR@/build/bin/llama-server -m @MODEL@ -ngl 99 -c 8192 -b 512 -ub 128 --parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn auto --threads 4 --threads-batch 6 --alias qwen --no-warmup --jinja --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port @LLAMA_PORT@
+Restart=always
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=hearth chat + coding agent
+After=network.target hearth-qwen.service
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKSPACE@
+Environment=PYTHONPATH=@PREFIX@
+Environment=HEARTH_WORKSPACE=@WORKSPACE@
+Environment=HEARTH_PORT=@PORT@
+Environment=HEARTH_LLAMA_HOST=127.0.0.1
+Environment=HEARTH_LLAMA_PORT=@LLAMA_PORT@
+Environment=HEARTH_MODEL=qwen
+ExecStart=/usr/bin/python3 -m hearth
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
