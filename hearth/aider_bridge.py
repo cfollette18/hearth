@@ -32,6 +32,9 @@ QUESTION_RE = re.compile(
     r"(?i)^\s*(what|why|how|who|where|which|explain|list|tell me|can you|could you|"
     r"would you|is there|are there)\b|[?]\s*$"
 )
+LIST_RE = re.compile(
+    r"(?i)\b(list (the )?files|what'?s in (the )?(workspace|repo|dir|folder)|show (me )?(the )?files)\b"
+)
 FILE_RE = re.compile(r"[\w./-]+\.[A-Za-z0-9]+")
 NO_EDIT_HINT = (
     "\n\nDo not output file listings and do not change any files. "
@@ -187,10 +190,8 @@ class TurnUI:
         self.order: list[str] = []
         self.cards: dict[str, dict] = {}
         self.seen_reads: set[str] = set()
-        self.mapped = False
         self.prose = ""
         self.last_stream = 0.0
-        self.aider_id = "aider-" + uuid.uuid4().hex[:8]
         self.allow_edits = True
         self.named_files: set[str] = set()
 
@@ -205,30 +206,30 @@ class TurnUI:
     def tools(self) -> list[dict]:
         return [self.cards[tid] for tid in self.order if tid in self.cards]
 
-    def start(self, model: str) -> None:
+    def list_workspace(self) -> None:
+        names = []
+        for path in sorted(self.workspace.rglob("*")):
+            if not path.is_file() and not path.is_dir():
+                continue
+            if any(part in SKIP_PARTS for part in path.parts):
+                continue
+            if any(path.name.startswith(p) for p in SKIP_PREFIXES):
+                continue
+            rel = str(path.relative_to(self.workspace))
+            if rel == ".":
+                continue
+            names.append(rel + ("/" if path.is_dir() else ""))
+        listing = "\n".join(names) or "(empty)"
         self.put(
             _tool(
-                self.aider_id,
-                "aider",
-                "Aider",
-                "call",
-                model,
-                "running",
-                calling="Aider is working",
-                summary=model,
-            )
-        )
-
-    def finish_aider(self, summary: str) -> None:
-        self.put(
-            _tool(
-                self.aider_id,
-                "aider",
-                "Aider",
-                "call",
-                "workspace",
+                "list:.",
+                "list_dir",
+                "Listed",
+                "list",
+                ".",
                 "done",
-                summary=summary,
+                summary=f"{len(names)} entries",
+                preview=listing,
             )
         )
 
@@ -270,24 +271,6 @@ class TurnUI:
                 "done",
                 summary=summary,
                 preview=preview,
-            )
-        )
-
-    def map_repo(self, messages: list) -> None:
-        if self.mapped or not messages:
-            return
-        self.mapped = True
-        text = "\n\n".join(str(m.get("content") or "") for m in messages if isinstance(m, dict))
-        self.put(
-            _tool(
-                "map:repo",
-                "grep",
-                "Mapped",
-                "search",
-                "repo",
-                "done",
-                summary="repo map",
-                preview=text,
             )
         )
 
@@ -461,7 +444,7 @@ class SessionAider:
             dirty_commits=False,
             auto_lint=False,
             stream=True,
-            map_tokens=1024,
+            map_tokens=0,
             suggest_shell_commands=True,
             detect_urls=False,
         )
@@ -484,7 +467,6 @@ class SessionAider:
         orig_add = coder.add_rel_fname
         orig_stream = coder.show_send_output_stream
         orig_show = coder.show_send_output
-        orig_repo = coder.get_repo_messages
         orig_apply = coder.apply_updates
         orig_shell = coder.run_shell_commands
         orig_check = coder.check_for_file_mentions
@@ -503,11 +485,6 @@ class SessionAider:
         def show_send_output(completion):
             orig_show(completion)
             self.ui.on_stream(coder.partial_response_content or "", force=True)
-
-        def get_repo_messages():
-            msgs = orig_repo()
-            self.ui.map_repo(msgs)
-            return msgs
 
         def check_for_file_mentions(content):
             if not self._mention_files:
@@ -538,7 +515,6 @@ class SessionAider:
         coder.add_rel_fname = add_rel_fname
         coder.show_send_output_stream = show_send_output_stream
         coder.show_send_output = show_send_output
-        coder.get_repo_messages = get_repo_messages
         coder.apply_updates = apply_updates
         coder.run_shell_commands = run_shell_commands
         coder.check_for_file_mentions = check_for_file_mentions
@@ -584,11 +560,11 @@ class SessionAider:
         self.ui.named_files = self._named_files
         self.io.ui = self.ui
         self.coder.io = self.io
-        self.ui.start(self.coder.main_model.name)
+        if LIST_RE.search(user_text):
+            self.ui.list_workspace()
         try:
             self.coder.run(with_message=message, preproc=True)
-        except Exception as exc:
-            self.ui.finish_aider(str(exc)[:120])
+        except Exception:
             raise
         text = self.ui.prose or parse_stream_files(self.coder.partial_response_content or "")[0]
         after = snapshot(self.workspace)
@@ -607,9 +583,6 @@ class SessionAider:
             else:
                 text = (self.coder.partial_response_content or "").strip() or "Aider finished without a text reply."
             emit({"type": "text", "text": text})
-        n_edits = len(changed)
-        summary = f"{n_edits} file{'s' if n_edits != 1 else ''} changed" if n_edits else "done"
-        self.ui.finish_aider(summary)
         return text, self.ui.tools()
 
 
