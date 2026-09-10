@@ -266,6 +266,8 @@ class TurnUI:
         )
 
     def write_live(self, rel: str, new_text: str, closed: bool) -> None:
+        if rel not in self.seen_reads and (self.workspace / rel).is_file():
+            self.read_file(rel)
         tid = "write:" + rel
         old = self.before.get(rel, "")
         if rel not in self.before and not new_text:
@@ -348,11 +350,14 @@ class TurnUI:
             return
         self.last_stream = now
         prose, files = parse_stream_files(raw)
-        if len(prose) > len(self.prose):
-            delta = prose[len(self.prose) :]
-            self.prose = prose
-            if delta:
+        committed = prose if files else (prose.rsplit("\n", 1)[0] if "\n" in prose else "")
+        if len(committed) > len(self.prose):
+            delta = committed[len(self.prose) :]
+            self.prose = committed
+            if delta.strip():
                 self.emit({"type": "text", "text": delta})
+        else:
+            self.prose = committed
         for fname, body, closed in files:
             if not fname or fname == "(file)":
                 continue
