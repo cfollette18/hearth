@@ -214,19 +214,19 @@ a:hover { text-decoration: underline; }
       <div class="chat-stage">
         <div class="chat-scroll">
           <div class="chat-empty" id="chat-empty">
-            <h1>Ask the workspace</h1>
-            <p>Hearth reads files, edits code, and shows every tool call — Qwen on this box, no cloud.</p>
+            <h1>Ask Aider</h1>
+            <p>This chat is Aider. Qwen on this box reads, edits, and shows every change — no cloud.</p>
             <div class="chat-suggests">
               <button type="button" class="chat-suggest" data-suggest="List the files in this workspace.">What's in the workspace?</button>
               <button type="button" class="chat-suggest" data-suggest="Create hello.py that prints hello from hearth, then show me the file.">Write a hello.py</button>
-              <button type="button" class="chat-suggest" data-suggest="Explain how to run Aider against this same Qwen model.">How do I use Aider?</button>
+              <button type="button" class="chat-suggest" data-suggest="Add a short README.md that explains this workspace.">Write a README</button>
             </div>
           </div>
           <div class="chat-thread" id="chat-thread" hidden></div>
         </div>
         <form class="chat-composer" id="chat-form">
           <label class="sr-only" for="chat-input">Message</label>
-          <textarea id="chat-input" rows="1" placeholder="Ask hearth to read, edit, or run something" autocomplete="off"></textarea>
+          <textarea id="chat-input" rows="1" placeholder="Ask Aider to read, edit, or run something" autocomplete="off"></textarea>
           <button type="submit" class="chat-send" id="chat-send" aria-label="Send">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"/>
@@ -235,7 +235,7 @@ a:hover { text-decoration: underline; }
           <button type="button" class="chat-send chat-stop" id="chat-stop" hidden aria-label="Stop">
             <span class="chat-stop-sq"></span>
           </button>
-          <p class="chat-model" id="chat-model">Agent</p>
+          <p class="chat-model" id="chat-model">Aider</p>
         </form>
       </div>
     </div>
@@ -491,7 +491,10 @@ a:hover { text-decoration: underline; }
       const res = await fetch("/settings.json");
       if (!res.ok) return;
       const data = await res.json();
-      if (data.model) modelEl.textContent = data.model + (data.workspace ? " · " + data.workspace.replace(/\/home\/[^/]+/, "~") : "");
+      const harness = data.harness ? data.harness + " " + (data.aider || "") : "";
+      const model = data.model || "";
+      const ws = data.workspace ? data.workspace.replace(/\/home\/[^/]+/, "~") : "";
+      modelEl.textContent = [harness || "Aider", model, ws].filter(Boolean).join(" · ");
       const meta = document.getElementById("top-meta");
       if (meta && data.workspace) meta.textContent = data.workspace;
     } catch (e) {}

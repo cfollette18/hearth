@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hearth: Quinovo-look chat + coding agent on local llama-server."""
+"""Hearth: Quinovo-look chat that is Aider, on local llama-server."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from hearth.tools import META, TOOLS, parse_args, run_tool
+from hearth.aider_bridge import aider_version, get_session
 
 LISTEN_HOST = os.environ.get("HEARTH_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("HEARTH_PORT", "8090"))
@@ -21,12 +21,6 @@ MODEL = os.environ.get("HEARTH_MODEL", "qwen")
 WORKSPACE = Path(os.environ.get("HEARTH_WORKSPACE", str(Path.home() / "hearth-workspace")))
 STATIC = Path(__file__).with_name("static")
 SESSIONS = Path(os.environ.get("HEARTH_SESSIONS", str(Path.home() / ".local/share/hearth/sessions")))
-MAX_STEPS = int(os.environ.get("HEARTH_MAX_STEPS", "8"))
-
-SYSTEM = """You are Hearth, a coding agent on a local Jetson. You edit files in the workspace using tools.
-Show your work: call tools instead of claiming you did something. Prefer small edits. Never invent file contents — read first.
-When you write or edit code, the user sees the diff in the chat. Keep answers short after the tools finish.
-Thinking is disabled. Do not wrap replies in JSON."""
 
 
 def _ensure_dirs() -> None:
@@ -60,42 +54,6 @@ def list_sessions() -> list:
     return rows[:80]
 
 
-def llama(messages: list, tools: list | None, stream: bool) -> dict:
-    body = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.2,
-        "stream": stream,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
-    raw = json.dumps(body).encode()
-    conn = HTTPConnection(LLAMA_HOST, LLAMA_PORT, timeout=600)
-    try:
-        conn.request(
-            "POST",
-            "/v1/chat/completions",
-            body=raw,
-            headers={"Content-Type": "application/json"},
-        )
-        resp = conn.getresponse()
-        data = resp.read()
-        if resp.status >= 400:
-            return {"error": data.decode("utf-8", errors="replace"), "status": resp.status}
-        return json.loads(data)
-    finally:
-        conn.close()
-
-
-def extract_message(data: dict) -> dict:
-    choices = data.get("choices") or []
-    if not choices:
-        return {"role": "assistant", "content": data.get("error") or ""}
-    return choices[0].get("message") or {"role": "assistant", "content": ""}
-
-
 def run_agent(user_text: str, session: dict, emit) -> None:
     history = session.setdefault("messages", [])
     history.append({"role": "user", "content": user_text, "tools": []})
@@ -103,95 +61,16 @@ def run_agent(user_text: str, session: dict, emit) -> None:
         session["title"] = user_text[:42]
         emit({"type": "session", "id": session["id"], "title": session["title"]})
 
-    llm_msgs: list = [{"role": "system", "content": SYSTEM}]
-    for msg in history:
-        if msg["role"] == "user":
-            llm_msgs.append({"role": "user", "content": msg["content"]})
-        elif msg["role"] == "assistant":
-            llm_msgs.append({"role": "assistant", "content": msg.get("content") or ""})
-
     assistant_ui = {"role": "assistant", "content": "", "tools": []}
     history.append(assistant_ui)
 
-    for _ in range(MAX_STEPS):
-        data = llama(llm_msgs, TOOLS, stream=False)
-        if data.get("error"):
-            emit({"type": "error", "message": str(data["error"])[:400]})
-            assistant_ui["content"] = "The model endpoint failed."
-            save_session(session)
-            emit({"type": "done", "text": assistant_ui["content"]})
-            return
-        message = extract_message(data)
-        calls = message.get("tool_calls") or []
-        content = message.get("content") or ""
-        if calls:
-            llm_msgs.append(message)
-            ui_tools = []
-            for call in calls:
-                fn = call.get("function") or {}
-                name = fn.get("name") or "call"
-                args = parse_args(fn.get("arguments"))
-                meta = META.get(name, {"verb": name, "calling": "Calling " + name, "icon": "call"})
-                tid = str(call.get("id") or uuid.uuid4())
-                target = str(args.get("path") or args.get("command") or args.get("pattern") or "")
-                emit(
-                    {
-                        "type": "tool",
-                        "id": tid,
-                        "name": name,
-                        "verb": meta["verb"],
-                        "calling": meta["calling"],
-                        "icon": meta["icon"],
-                        "target": target,
-                        "status": "running",
-                    }
-                )
-                result = run_tool(WORKSPACE, name, args)
-                emit(
-                    {
-                        "type": "tool",
-                        "id": tid,
-                        "name": name,
-                        "verb": meta["verb"],
-                        "icon": meta["icon"],
-                        "target": result.get("target") or target,
-                        "status": "done",
-                        "summary": result.get("summary") or "",
-                        "preview": result.get("preview") or "",
-                    }
-                )
-                ui_tools.append(
-                    {
-                        "id": tid,
-                        "name": name,
-                        "verb": meta["verb"],
-                        "icon": meta["icon"],
-                        "target": result.get("target") or target,
-                        "status": "done",
-                        "summary": result.get("summary") or "",
-                        "preview": result.get("preview") or "",
-                    }
-                )
-                llm_msgs.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tid,
-                        "content": result.get("payload") or "",
-                    }
-                )
-            assistant_ui["tools"].extend(ui_tools)
-            continue
-        if content:
-            emit({"type": "text", "text": content})
-            assistant_ui["content"] = (assistant_ui.get("content") or "") + content
-        break
-    else:
-        note = "Stopped after too many tool steps."
-        emit({"type": "text", "text": note})
-        assistant_ui["content"] = (assistant_ui.get("content") or "") + note
-
+    aider = get_session(session["id"], WORKSPACE, LLAMA_HOST, LLAMA_PORT, MODEL)
+    with aider.lock:
+        text, tools = aider.run(user_text, emit)
+    assistant_ui["content"] = text
+    assistant_ui["tools"] = tools
     save_session(session)
-    emit({"type": "done", "text": assistant_ui.get("content") or ""})
+    emit({"type": "done", "text": text})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -213,7 +92,16 @@ class Handler(BaseHTTPRequestHandler):
             sid = path.split("/")[-1]
             self._json(200, load_session(sid))
         elif path == "/settings.json":
-            self._json(200, {"ready": True, "model": MODEL, "workspace": str(WORKSPACE)})
+            self._json(
+                200,
+                {
+                    "ready": True,
+                    "harness": "aider",
+                    "aider": aider_version(),
+                    "model": MODEL,
+                    "workspace": str(WORKSPACE),
+                },
+            )
         else:
             self._json(404, {"error": "not found"})
 
@@ -289,7 +177,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     _ensure_dirs()
-    print(f"hearth chat http://{LISTEN_HOST}:{LISTEN_PORT} workspace={WORKSPACE}", flush=True)
+    print(
+        f"hearth chat http://{LISTEN_HOST}:{LISTEN_PORT} "
+        f"harness=aider/{aider_version()} workspace={WORKSPACE}",
+        flush=True,
+    )
     ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()
 
 

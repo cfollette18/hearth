@@ -52,6 +52,21 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 uv tool install --quiet aider-chat || uv tool install aider-chat
+AIDER_PY="${HOME}/.local/share/uv/tools/aider-chat/bin/python"
+if [ ! -x "$AIDER_PY" ]; then
+  AIDER_BIN="$(command -v aider || true)"
+  if [ -n "$AIDER_BIN" ]; then
+    AIDER_PY="$(sed -n '1s/^#!//p' "$AIDER_BIN")"
+  fi
+fi
+if [ ! -x "$AIDER_PY" ]; then
+  echo "aider python not found after uv tool install"
+  exit 1
+fi
+if [ ! -d "$WORKSPACE/.git" ]; then
+  git -C "$WORKSPACE" init
+  git -C "$WORKSPACE" -c user.email=hearth@local -c user.name=hearth commit --allow-empty -m "hearth workspace"
+fi
 
 cat > "$HOME/.config/hearth/aider.yml" << EOF
 openai-api-base: http://127.0.0.1:${LLAMA_PORT}/v1
@@ -96,6 +111,7 @@ sed -e "s|@HOME@|$HOME|g" \
     -e "s|@WORKSPACE@|$WORKSPACE|g" \
     -e "s|@PORT@|$PORT|g" \
     -e "s|@LLAMA_PORT@|$LLAMA_PORT|g" \
+    -e "s|@AIDER_PY@|$AIDER_PY|g" \
     "$SRC/pack/hearth.service" > "$HOME/.config/systemd/user/hearth.service"
 
 loginctl enable-linger "$USER" >/dev/null 2>&1 || true
@@ -120,5 +136,5 @@ echo
 echo "hearth is up"
 echo "  chat     http://127.0.0.1:${PORT}"
 echo "  tailnet  http://$(hostname):${PORT}  (or MagicDNS :${PORT})"
-echo "  aider    cd $WORKSPACE && hearth-aider"
+echo "  chat is Aider (same as: cd $WORKSPACE && hearth-aider)"
 echo "  workspace $WORKSPACE"

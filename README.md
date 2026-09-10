@@ -1,10 +1,11 @@
 # hearth
 
 Local coding agent for an NVIDIA Jetson (Orin Nano and friends). One command
-installs **Qwen**, a **Quinovo-look chat** that shows every tool call and diff,
-and **Aider** pointed at the same model.
+installs **Qwen** and a **Quinovo-look chat that is Aider**.
 
-No cloud inference. Chat and tools stay on the box. Reach it over Tailscale.
+The browser UI is the Aider harness: same model, same workspace, same
+whole-file edits, with every add/apply/diff shown as a tool card. No cloud
+inference. Reach it over Tailscale.
 
 ## One command
 
@@ -33,15 +34,15 @@ Over Tailscale: `http://<jetson-magicdns>:8090`.
 | Piece | What it is |
 |---|---|
 | `hearth-qwen.service` | llama.cpp server, Qwen3.5-4B Q4_K_M, `:8082` |
-| `hearth.service` | Chat + agent on `:8090` |
-| Chat UI | Same layout as Quinovo chat: oat/navy/lava, tool rows, lava caret |
-| Tools | `read_file`, `write_file`, `edit_file`, `list_dir`, `grep`, `bash` |
-| Diffs | Writes and edits show unified diffs in the thread |
-| `hearth-aider` | Aider CLI against the same Qwen endpoint |
+| `hearth.service` | Quinovo-look chat on `:8090`, driven by Aider |
+| Chat UI | Oat/navy/lava, tool rows, lava caret, unified diffs |
+| Harness | Aider 0.86 (`edit-format: whole`) against `openai/qwen` |
+| `hearth-aider` | Same Aider in the terminal |
 
-Workspace defaults to `~/hearth-workspace`. The agent cannot write outside it.
+Workspace defaults to `~/hearth-workspace` (a git repo). Aider cannot write
+outside it.
 
-## Aider (terminal)
+## Terminal
 
 ```bash
 cd ~/hearth-workspace

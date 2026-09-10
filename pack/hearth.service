@@ -1,5 +1,5 @@
 [Unit]
-Description=hearth chat + coding agent
+Description=hearth chat (Aider) + Qwen
 After=network.target hearth-qwen.service
 
 [Service]
@@ -11,7 +11,11 @@ Environment=HEARTH_PORT=@PORT@
 Environment=HEARTH_LLAMA_HOST=127.0.0.1
 Environment=HEARTH_LLAMA_PORT=@LLAMA_PORT@
 Environment=HEARTH_MODEL=qwen
-ExecStart=/usr/bin/python3 -m hearth
+Environment=OPENAI_API_BASE=http://127.0.0.1:@LLAMA_PORT@/v1
+Environment=OPENAI_API_KEY=local
+Environment=NO_COLOR=1
+Environment=AIDER_ANALYTICS=false
+ExecStart=@AIDER_PY@ -m hearth
 Restart=always
 RestartSec=3
 
