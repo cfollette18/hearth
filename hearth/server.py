@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 import uuid
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -138,6 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             run_agent(text, session, emit)
         except Exception as exc:
+            traceback.print_exc()
             emit({"type": "error", "message": str(exc)[:400]})
             emit({"type": "done", "text": ""})
 

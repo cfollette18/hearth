@@ -116,6 +116,12 @@ class HearthIO(InputOutput):
     """Aider IO that forwards the tool log into Quinovo SSE cards."""
 
     def __init__(self, workspace: Path, emit):
+        self._emit = emit
+        self.workspace = workspace
+        self.live_id = "aider-" + uuid.uuid4().hex[:8]
+        self.live_log: list[str] = []
+        self.added: list[str] = []
+        self.applied: list[str] = []
         super().__init__(
             pretty=False,
             yes=True,
@@ -123,12 +129,6 @@ class HearthIO(InputOutput):
             encoding="utf-8",
             root=str(workspace),
         )
-        self._emit = emit
-        self.workspace = workspace
-        self.live_id = "aider-" + uuid.uuid4().hex[:8]
-        self.live_log: list[str] = []
-        self.added: list[str] = []
-        self.applied: list[str] = []
 
     def reset_turn(self, emit) -> None:
         self._emit = emit
@@ -203,8 +203,11 @@ class SessionAider:
         ensure_git(self.workspace)
         self.io = HearthIO(self.workspace, lambda _event: None)
         git_repo = GitRepo(self.io, [], str(self.workspace))
-        llm = Model("openai/" + model, weak_model=False, editor_model=False)
+        llm = Model("openai/" + model)
         llm.edit_format = "whole"
+        if not llm.info:
+            llm.info = {}
+        llm.info.setdefault("max_input_tokens", 8192)
         self.coder = Coder.create(
             main_model=llm,
             edit_format="whole",
