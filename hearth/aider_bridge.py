@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -22,6 +23,7 @@ SKIP_PREFIXES = (".aider",)
 MAX_PREVIEW = 8000
 ADDED_RE = re.compile(r"^Added (.+) to the chat")
 APPLIED_RE = re.compile(r"^Applied edit to (.+)$")
+STREAM_MS = 0.08
 
 os.environ.setdefault("NO_COLOR", "1")
 os.environ.setdefault("AIDER_ANALYTICS", "false")
@@ -76,11 +78,50 @@ def snapshot(root: Path) -> dict[str, str]:
     return files
 
 
-def prose_from_aider(content: str) -> str:
-    text = (content or "").strip()
-    if "```" in text:
-        text = text.split("```", 1)[0].strip()
-    return text
+def clip(text: str, n: int = MAX_PREVIEW) -> str:
+    if len(text) <= n:
+        return text
+    return text[:n] + "\n… truncated …"
+
+
+def clean_fname(raw: str) -> str:
+    fname = (raw or "").strip()
+    fname = fname.strip("*")
+    fname = fname.rstrip(":")
+    fname = fname.strip("`")
+    fname = fname.lstrip("#").strip()
+    if len(fname) > 250:
+        return ""
+    return fname
+
+
+def parse_stream_files(content: str) -> tuple[str, list[tuple[str, str, bool]]]:
+    """Split whole-file output into prose and (filename, body, closed) blocks."""
+    lines = (content or "").splitlines(keepends=True)
+    prose: list[str] = []
+    files: list[tuple[str, str, bool]] = []
+    fname: str | None = None
+    body: list[str] = []
+    for i, line in enumerate(lines):
+        if line.startswith("```"):
+            if fname is not None:
+                files.append((fname, "".join(body), True))
+                fname = None
+                body = []
+                continue
+            prev = clean_fname(lines[i - 1]) if i else ""
+            if prev and prose and prose[-1].strip() == prev:
+                prose.pop()
+            fname = prev or "(file)"
+            body = []
+            continue
+        if fname is not None:
+            body.append(line)
+        else:
+            prose.append(line)
+    if fname is not None:
+        files.append((fname, "".join(body), False))
+    return "".join(prose).strip(), files
 
 
 def aider_version() -> str:
@@ -108,20 +149,221 @@ def _tool(
         "target": target,
         "status": status,
         "summary": summary,
-        "preview": preview[:MAX_PREVIEW],
+        "preview": clip(preview),
     }
 
 
-class HearthIO(InputOutput):
-    """Aider IO that forwards the tool log into Quinovo SSE cards."""
+class TurnUI:
+    """Quinovo SSE cards for one Aider turn."""
 
-    def __init__(self, workspace: Path, emit):
-        self._emit = emit
+    def __init__(self, emit, workspace: Path, before: dict[str, str]):
+        self.emit = emit
         self.workspace = workspace
-        self.live_id = "aider-" + uuid.uuid4().hex[:8]
-        self.live_log: list[str] = []
-        self.added: list[str] = []
-        self.applied: list[str] = []
+        self.before = before
+        self.order: list[str] = []
+        self.cards: dict[str, dict] = {}
+        self.seen_reads: set[str] = set()
+        self.mapped = False
+        self.prose = ""
+        self.last_stream = 0.0
+        self.aider_id = "aider-" + uuid.uuid4().hex[:8]
+
+    def put(self, card: dict) -> dict:
+        tid = card["id"]
+        if tid not in self.cards:
+            self.order.append(tid)
+        self.cards[tid] = card
+        self.emit(card)
+        return card
+
+    def tools(self) -> list[dict]:
+        return [self.cards[tid] for tid in self.order if tid in self.cards]
+
+    def start(self, model: str) -> None:
+        self.put(
+            _tool(
+                self.aider_id,
+                "aider",
+                "Aider",
+                "call",
+                model,
+                "running",
+                calling="Aider is working",
+                summary=model,
+            )
+        )
+
+    def finish_aider(self, summary: str) -> None:
+        self.put(
+            _tool(
+                self.aider_id,
+                "aider",
+                "Aider",
+                "call",
+                "workspace",
+                "done",
+                summary=summary,
+            )
+        )
+
+    def read_file(self, rel: str, reason: str = "") -> None:
+        rel = rel.strip()
+        if not rel or rel in self.seen_reads:
+            return
+        self.seen_reads.add(rel)
+        tid = "read:" + rel
+        path = self.workspace / rel
+        self.put(
+            _tool(
+                tid,
+                "read_file",
+                "Read",
+                "read",
+                rel,
+                "running",
+                calling="Reading",
+                summary=reason or "file",
+            )
+        )
+        preview = ""
+        summary = "missing"
+        if path.is_file():
+            try:
+                preview = path.read_text(encoding="utf-8", errors="replace")
+                lines = preview.count("\n") + (0 if preview.endswith("\n") or not preview else 1)
+                summary = f"{lines} lines" + (f" · {reason}" if reason else "")
+            except OSError as exc:
+                summary = str(exc)[:80]
+        self.put(
+            _tool(
+                tid,
+                "read_file",
+                "Read",
+                "read",
+                rel,
+                "done",
+                summary=summary,
+                preview=preview,
+            )
+        )
+
+    def map_repo(self, messages: list) -> None:
+        if self.mapped or not messages:
+            return
+        self.mapped = True
+        text = "\n\n".join(str(m.get("content") or "") for m in messages if isinstance(m, dict))
+        self.put(
+            _tool(
+                "map:repo",
+                "grep",
+                "Mapped",
+                "search",
+                "repo",
+                "done",
+                summary="repo map",
+                preview=text,
+            )
+        )
+
+    def write_live(self, rel: str, new_text: str, closed: bool) -> None:
+        tid = "write:" + rel
+        old = self.before.get(rel, "")
+        if rel not in self.before and not new_text:
+            preview = ""
+        else:
+            preview = unified_diff(rel, old, new_text) or new_text
+        lines = new_text.count("\n") + (1 if new_text and not new_text.endswith("\n") else 0)
+        if closed:
+            verb = "Wrote" if rel not in self.before else "Edited"
+            self.put(
+                _tool(
+                    tid,
+                    "write_file",
+                    verb,
+                    "write",
+                    rel,
+                    "running",
+                    calling="Writing",
+                    summary=f"{lines} lines",
+                    preview=preview,
+                )
+            )
+            return
+        self.put(
+            _tool(
+                tid,
+                "write_file",
+                "Edited",
+                "write",
+                rel,
+                "running",
+                calling="Writing",
+                summary="streaming",
+                preview=preview,
+            )
+        )
+
+    def write_done(self, rel: str, after: dict[str, str]) -> None:
+        tid = "write:" + rel
+        old = self.before.get(rel, "")
+        new = after.get(rel, "")
+        diff = unified_diff(rel, old, new)
+        if rel not in self.before:
+            verb = "Wrote"
+        elif rel not in after:
+            verb = "Deleted"
+        else:
+            verb = "Edited"
+        summary = f"{new.count(chr(10)) + (1 if new else 0)} lines" if new else "removed"
+        self.put(
+            _tool(
+                tid,
+                "write_file",
+                verb,
+                "write",
+                rel,
+                "done",
+                summary=summary,
+                preview=diff or new,
+            )
+        )
+
+    def run_cmd(self, command: str) -> None:
+        tid = "run:" + uuid.uuid4().hex[:8]
+        self.put(
+            _tool(
+                tid,
+                "bash",
+                "Ran",
+                "run",
+                str(command),
+                "done",
+                summary="shell",
+            )
+        )
+
+    def on_stream(self, raw: str, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self.last_stream) < STREAM_MS:
+            return
+        self.last_stream = now
+        prose, files = parse_stream_files(raw)
+        if len(prose) > len(self.prose):
+            delta = prose[len(self.prose) :]
+            self.prose = prose
+            if delta:
+                self.emit({"type": "text", "text": delta})
+        for fname, body, closed in files:
+            if not fname or fname == "(file)":
+                continue
+            self.write_live(fname, body, closed)
+
+
+class HearthIO(InputOutput):
+    """Aider IO that forwards file add/apply into Quinovo cards."""
+
+    def __init__(self, workspace: Path, ui: TurnUI | None):
+        self.ui = ui
         super().__init__(
             pretty=False,
             yes=True,
@@ -130,48 +372,23 @@ class HearthIO(InputOutput):
             root=str(workspace),
         )
 
-    def reset_turn(self, emit) -> None:
-        self._emit = emit
-        self.live_id = "aider-" + uuid.uuid4().hex[:8]
-        self.live_log = []
-        self.added = []
-        self.applied = []
-
-    def _on_tool_line(self, text: str) -> None:
-        self.live_log.append(text)
-        added = ADDED_RE.match(text)
-        applied = APPLIED_RE.match(text)
-        if added:
-            self.added.append(added.group(1).strip())
-        if applied:
-            self.applied.append(applied.group(1).strip())
-        self._emit(
-            _tool(
-                self.live_id,
-                "aider",
-                "Aider",
-                "call",
-                "workspace",
-                "running",
-                calling="Aider is working",
-                summary=text[:120],
-                preview="\n".join(self.live_log[-50:]),
-            )
-        )
-
     def tool_output(self, *messages, log_only=False, bold=False):
         text = " ".join(str(m) for m in messages).strip()
-        if text and not log_only:
-            self._on_tool_line(text)
+        if text and not log_only and self.ui:
+            added = ADDED_RE.match(text)
+            applied = APPLIED_RE.match(text)
+            if added:
+                self.ui.read_file(added.group(1).strip())
+            elif applied:
+                pass
+            elif text.startswith("Repo-map:"):
+                pass
         try:
             super().tool_output(*messages, log_only=log_only, bold=bold)
         except Exception:
             pass
 
     def tool_error(self, message="", strip=True):
-        text = str(message or "").strip()
-        if text:
-            self._on_tool_line(text)
         try:
             super().tool_error(message, strip=strip)
         except Exception:
@@ -180,20 +397,6 @@ class HearthIO(InputOutput):
     def assistant_output(self, message, pretty=None):
         return
 
-    def finish_live(self, summary: str) -> dict:
-        card = _tool(
-            self.live_id,
-            "aider",
-            "Aider",
-            "call",
-            "workspace",
-            "done",
-            summary=summary,
-            preview="\n".join(self.live_log[-50:]),
-        )
-        self._emit(card)
-        return card
-
 
 class SessionAider:
     def __init__(self, workspace: Path, llama_host: str, llama_port: int, model: str):
@@ -201,10 +404,12 @@ class SessionAider:
         self.lock = threading.Lock()
         configure_openai(f"http://{llama_host}:{llama_port}/v1")
         ensure_git(self.workspace)
-        self.io = HearthIO(self.workspace, lambda _event: None)
+        self.ui = TurnUI(lambda _event: None, self.workspace, {})
+        self.io = HearthIO(self.workspace, self.ui)
         git_repo = GitRepo(self.io, [], str(self.workspace))
         llm = Model("openai/" + model)
         llm.edit_format = "whole"
+        llm.streaming = True
         if not llm.info:
             llm.info = {}
         llm.info.setdefault("max_input_tokens", 8192)
@@ -217,11 +422,72 @@ class SessionAider:
             auto_commits=False,
             dirty_commits=False,
             auto_lint=False,
-            stream=False,
+            stream=True,
             map_tokens=1024,
             suggest_shell_commands=True,
             detect_urls=False,
         )
+        self.coder.stream = True
+        self._patch_coder()
+
+    def _patch_coder(self) -> None:
+        coder = self.coder
+        orig_add = coder.add_rel_fname
+        orig_stream = coder.show_send_output_stream
+        orig_show = coder.show_send_output
+        orig_repo = coder.get_repo_messages
+        orig_apply = coder.apply_updates
+        orig_shell = coder.run_shell_commands
+
+        def add_rel_fname(rel_fname):
+            orig_add(rel_fname)
+            self.ui.read_file(rel_fname)
+
+        def show_send_output_stream(completion):
+            for text in orig_stream(completion):
+                self.ui.on_stream(coder.partial_response_content or "")
+                yield text
+            self.ui.on_stream(coder.partial_response_content or "", force=True)
+
+        def show_send_output(completion):
+            orig_show(completion)
+            self.ui.on_stream(coder.partial_response_content or "", force=True)
+
+        def get_repo_messages():
+            msgs = orig_repo()
+            self.ui.map_repo(msgs)
+            return msgs
+
+        def apply_updates():
+            edited = orig_apply()
+            after = snapshot(self.workspace)
+            names = {self.rel_of(p) for p in (edited or set())}
+            for rel, body, _closed in parse_stream_files(coder.partial_response_content or "")[1]:
+                names.add(rel)
+            for rel in after:
+                if self.ui.before.get(rel, "") != after[rel]:
+                    names.add(rel)
+            for rel in list(self.ui.before):
+                if rel not in after:
+                    names.add(rel)
+            for rel in sorted(names):
+                if rel and rel != "(file)":
+                    self.ui.write_done(rel, after)
+            return edited
+
+        def run_shell_commands():
+            pending = list(getattr(coder, "shell_commands", None) or [])
+            result = orig_shell()
+            for cmd in pending:
+                self.ui.run_cmd(cmd)
+            return result
+
+        coder.add_rel_fname = add_rel_fname
+        coder.show_send_output_stream = show_send_output_stream
+        coder.show_send_output = show_send_output
+        coder.get_repo_messages = get_repo_messages
+        coder.apply_updates = apply_updates
+        coder.run_shell_commands = run_shell_commands
 
     def rel_of(self, path: str) -> str:
         try:
@@ -230,91 +496,40 @@ class SessionAider:
             return path
 
     def run(self, user_text: str, emit) -> tuple[str, list[dict]]:
-        self.io.reset_turn(emit)
-        self.coder.io = self.io
         before = snapshot(self.workspace)
-        emit(
-            _tool(
-                self.io.live_id,
-                "aider",
-                "Aider",
-                "call",
-                "workspace",
-                "running",
-                calling="Aider is working",
-                summary=self.coder.main_model.name,
-            )
-        )
-        tools: list[dict] = []
+        self.ui = TurnUI(emit, self.workspace, before)
+        self.io.ui = self.ui
+        self.coder.io = self.io
+        self.ui.start(self.coder.main_model.name)
+        for rel in self.coder.get_inchat_relative_files():
+            self.ui.read_file(rel, reason="in context")
         try:
             self.coder.run(with_message=user_text, preproc=True)
         except Exception as exc:
-            self.io.finish_live(str(exc)[:120])
+            self.ui.finish_aider(str(exc)[:120])
             raise
+        text = self.ui.prose or parse_stream_files(self.coder.partial_response_content or "")[0]
         after = snapshot(self.workspace)
-
-        for rel in self.io.added:
-            tid = uuid.uuid4().hex[:10]
-            card = _tool(tid, "read_file", "Read", "read", rel, "done", summary="in chat")
-            emit(card)
-            tools.append(card)
-
-        changed: list[str] = []
+        changed = set()
         for rel, new in after.items():
             if before.get(rel, "") != new:
-                changed.append(rel)
+                changed.add(rel)
         for rel in before:
             if rel not in after:
-                changed.append(rel)
-        edited = {self.rel_of(p) for p in (self.io.applied + list(self.coder.aider_edited_files or []))}
-        seen_files: set[str] = set()
-        for rel in sorted(set(changed) | edited):
-            if rel in seen_files:
-                continue
-            seen_files.add(rel)
-            old = before.get(rel, "")
-            new = after.get(rel, "")
-            diff = unified_diff(rel, old, new)
-            if rel not in before:
-                verb = "Wrote"
-            elif rel not in after:
-                verb = "Deleted"
-            else:
-                verb = "Edited"
-            summary = f"{new.count(chr(10)) + (1 if new else 0)} lines" if new else "removed"
-            tid = uuid.uuid4().hex[:10]
-            card = _tool(
-                tid,
-                "write_file",
-                verb,
-                "write",
-                rel,
-                "done",
-                summary=summary,
-                preview=diff or new[:MAX_PREVIEW],
-            )
-            emit(card)
-            tools.append(card)
-
-        for cmd in list(getattr(self.coder, "shell_commands", None) or []):
-            tid = uuid.uuid4().hex[:10]
-            card = _tool(tid, "bash", "Ran", "run", str(cmd), "done", summary="shell")
-            emit(card)
-            tools.append(card)
-
-        raw = self.coder.partial_response_content or ""
-        text = prose_from_aider(raw)
+                changed.add(rel)
+        for rel in changed:
+            if ("write:" + rel) not in self.ui.cards:
+                self.ui.write_done(rel, after)
         if not text:
-            if seen_files:
-                text = "Applied edits to " + ", ".join(sorted(seen_files)) + "."
+            if changed:
+                text = "Applied edits to " + ", ".join(sorted(changed)) + "."
             else:
-                text = raw.strip() or "Aider finished without a text reply."
-        emit({"type": "text", "text": text})
-        n_edits = len(seen_files)
+                text = (self.coder.partial_response_content or "").strip() or "Aider finished without a text reply."
+            emit({"type": "text", "text": text})
+        n_edits = len(changed)
         summary = f"{n_edits} file{'s' if n_edits != 1 else ''} changed" if n_edits else "done"
-        live = self.io.finish_live(summary)
-        tools.insert(0, live)
-        return text, tools
+        self.ui.finish_aider(summary)
+        return text, self.ui.tools()
 
 
 _sessions: dict[str, SessionAider] = {}

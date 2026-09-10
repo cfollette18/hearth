@@ -137,12 +137,14 @@ a:hover { text-decoration: underline; }
   font-family: var(--mono); font-size: 12px; color: var(--muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
 }
+.chat-step-target:empty, .chat-step-sum:empty { display: none; }
 .chat-step-sum { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.4; }
 .chat-step-code {
   margin: 6px 0 8px 24px; background: var(--white); border: 1px solid var(--border);
   border-radius: 2px; font-family: var(--mono); font-size: 12px; line-height: 1.45;
-  overflow: auto; max-height: 280px; padding: 8px 0;
+  overflow: auto; max-height: 360px; padding: 8px 0;
 }
+.chat-step.running .chat-step-code { border-color: var(--lava); }
 .chat-step-code .ln { padding: 0 12px; white-space: pre; }
 .chat-step-code .add { background: var(--success-bg); }
 .chat-step-code .del { background: #fdeeee; }
@@ -336,9 +338,9 @@ a:hover { text-decoration: underline; }
         '<span class="chat-step-copy">' +
           '<span class="chat-step-line">' +
             '<span class="chat-step-verb"></span>' +
-            (target ? '<span class="chat-step-target"></span>' : "") +
+            '<span class="chat-step-target"></span>' +
           "</span>" +
-          (row.summary && !running ? '<span class="chat-step-sum"></span>' : "") +
+          '<span class="chat-step-sum"></span>' +
         "</span>" +
         (running ? '<span class="chat-spin" aria-hidden="true"></span>' : "") +
       "</div>";
@@ -348,8 +350,40 @@ a:hover { text-decoration: underline; }
     const sumEl = art.querySelector(".chat-step-sum");
     if (sumEl) sumEl.textContent = row.summary || "";
     const code = codeBlock(row.preview);
-    if (code) art.appendChild(code);
+    if (code) {
+      art.appendChild(code);
+      code.scrollTop = code.scrollHeight;
+    }
     return art;
+  }
+
+  function paintToolCard(art, row) {
+    const running = row.status === "running";
+    art.className = "chat-step" + (running ? " running" : " done");
+    art.dataset.id = row.id || "";
+    const verbEl = art.querySelector(".chat-step-verb");
+    const targetEl = art.querySelector(".chat-step-target");
+    const sumEl = art.querySelector(".chat-step-sum");
+    const verb = running
+      ? (row.calling || ("Calling " + (row.verb || row.name || "tool")))
+      : (row.verb || row.name || "Call");
+    if (verbEl) verbEl.textContent = verb;
+    if (targetEl) targetEl.textContent = row.target || "";
+    if (sumEl) sumEl.textContent = row.summary || "";
+    const spin = art.querySelector(".chat-spin");
+    if (running && !spin) {
+      const s = document.createElement("span");
+      s.className = "chat-spin";
+      s.setAttribute("aria-hidden", "true");
+      art.querySelector(".chat-step-row").appendChild(s);
+    } else if (!running && spin) spin.remove();
+    let code = art.querySelector(".chat-step-code");
+    if (row.preview) {
+      const next = codeBlock(row.preview);
+      if (code) code.replaceWith(next);
+      else art.appendChild(next);
+      next.scrollTop = next.scrollHeight;
+    }
   }
 
   function addUser(text) {
@@ -554,10 +588,13 @@ a:hover { text-decoration: underline; }
             writer.flush();
             const id = evnt.id || evnt.name;
             let card = cards[id];
-            const next = toolCard(evnt);
-            if (!card) toolsEl.appendChild(next);
-            else card.replaceWith(next);
-            cards[id] = next;
+            if (card) {
+              paintToolCard(card, evnt);
+            } else {
+              const next = toolCard(evnt);
+              toolsEl.appendChild(next);
+              cards[id] = next;
+            }
             scrollBottom();
           } else if (evnt.type === "error") {
             hidePending(box);
