@@ -24,6 +24,19 @@ MAX_PREVIEW = 8000
 ADDED_RE = re.compile(r"^Added (.+) to the chat")
 APPLIED_RE = re.compile(r"^Applied edit to (.+)$")
 STREAM_MS = 0.08
+EDIT_RE = re.compile(
+    r"(?i)\b(write|create|edit|change|fix|implement|delete|update|replace|rename|"
+    r"remove|append|modify|refactor)\b|\badd a\b|\badd the\b|\bmake a\b|\bmake an\b"
+)
+QUESTION_RE = re.compile(
+    r"(?i)^\s*(what|why|how|who|where|which|explain|list|tell me|can you|could you|"
+    r"would you|is there|are there)\b|[?]\s*$"
+)
+FILE_RE = re.compile(r"[\w./-]+\.[A-Za-z0-9]+")
+NO_EDIT_HINT = (
+    "\n\nDo not output file listings and do not change any files. "
+    "Answer the question in prose only."
+)
 
 os.environ.setdefault("NO_COLOR", "1")
 os.environ.setdefault("AIDER_ANALYTICS", "false")
@@ -76,6 +89,17 @@ def snapshot(root: Path) -> dict[str, str]:
         rel = str(path.relative_to(root))
         files[rel] = data.decode("utf-8", errors="replace")
     return files
+
+
+def filenames_in_text(text: str) -> set[str]:
+    return {m.lower() for m in FILE_RE.findall(text or "")}
+
+
+def user_wants_edits(text: str) -> bool:
+    named = filenames_in_text(text)
+    if QUESTION_RE.search(text or ""):
+        return bool(EDIT_RE.search(text or "") and named)
+    return bool(EDIT_RE.search(text or "") or named)
 
 
 def clip(text: str, n: int = MAX_PREVIEW) -> str:
@@ -167,6 +191,8 @@ class TurnUI:
         self.prose = ""
         self.last_stream = 0.0
         self.aider_id = "aider-" + uuid.uuid4().hex[:8]
+        self.allow_edits = True
+        self.named_files: set[str] = set()
 
     def put(self, card: dict) -> dict:
         tid = card["id"]
@@ -266,6 +292,11 @@ class TurnUI:
         )
 
     def write_live(self, rel: str, new_text: str, closed: bool) -> None:
+        if self.named_files:
+            key = rel.lower()
+            base = Path(rel).name.lower()
+            if key not in self.named_files and base not in self.named_files:
+                return
         if rel not in self.seen_reads and (self.workspace / rel).is_file():
             self.read_file(rel)
         tid = "write:" + rel
@@ -361,6 +392,8 @@ class TurnUI:
         for fname, body, closed in files:
             if not fname or fname == "(file)":
                 continue
+            if not self.allow_edits:
+                continue
             self.write_live(fname, body, closed)
 
 
@@ -433,6 +466,17 @@ class SessionAider:
             detect_urls=False,
         )
         self.coder.stream = True
+        self.coder.gpt_prompts.example_messages = []
+        self.coder.gpt_prompts.main_system = (
+            "Act as an expert software developer.\n"
+            "Answer questions in prose.\n"
+            "Only output a file listing if the user asked you to create or edit a file.\n"
+            "If they asked a question, do not modify files.\n"
+            "{final_reminders}\n"
+        )
+        self._mention_files = False
+        self._apply_edits = False
+        self._named_files: set[str] = set()
         self._patch_coder()
 
     def _patch_coder(self) -> None:
@@ -443,6 +487,8 @@ class SessionAider:
         orig_repo = coder.get_repo_messages
         orig_apply = coder.apply_updates
         orig_shell = coder.run_shell_commands
+        orig_check = coder.check_for_file_mentions
+        orig_preproc = coder.preproc_user_input
 
         def add_rel_fname(rel_fname):
             orig_add(rel_fname)
@@ -463,21 +509,23 @@ class SessionAider:
             self.ui.map_repo(msgs)
             return msgs
 
+        def check_for_file_mentions(content):
+            if not self._mention_files:
+                return None
+            return orig_check(content)
+
+        def preproc_user_input(inp):
+            self._mention_files = True
+            try:
+                return orig_preproc(inp)
+            finally:
+                self._mention_files = False
+
         def apply_updates():
+            if not self._apply_edits:
+                return set()
             edited = orig_apply()
-            after = snapshot(self.workspace)
-            names = {self.rel_of(p) for p in (edited or set())}
-            for rel, body, _closed in parse_stream_files(coder.partial_response_content or "")[1]:
-                names.add(rel)
-            for rel in after:
-                if self.ui.before.get(rel, "") != after[rel]:
-                    names.add(rel)
-            for rel in list(self.ui.before):
-                if rel not in after:
-                    names.add(rel)
-            for rel in sorted(names):
-                if rel and rel != "(file)":
-                    self.ui.write_done(rel, after)
+            self._revert_unasked_edits()
             return edited
 
         def run_shell_commands():
@@ -493,6 +541,8 @@ class SessionAider:
         coder.get_repo_messages = get_repo_messages
         coder.apply_updates = apply_updates
         coder.run_shell_commands = run_shell_commands
+        coder.check_for_file_mentions = check_for_file_mentions
+        coder.preproc_user_input = preproc_user_input
 
     def rel_of(self, path: str) -> str:
         try:
@@ -500,16 +550,43 @@ class SessionAider:
         except ValueError:
             return path
 
+    def _drop_chat_files(self) -> None:
+        self.coder.abs_fnames.clear()
+
+    def _revert_unasked_edits(self) -> None:
+        named = self._named_files
+        if not named:
+            return
+        after = snapshot(self.workspace)
+        for rel, new in after.items():
+            old = self.ui.before.get(rel, "")
+            if new == old:
+                continue
+            key = rel.lower()
+            base = Path(rel).name.lower()
+            if key in named or base in named:
+                continue
+            path = self.workspace / rel
+            if rel in self.ui.before:
+                path.write_text(old, encoding="utf-8")
+            elif path.is_file():
+                path.unlink()
+
     def run(self, user_text: str, emit) -> tuple[str, list[dict]]:
         before = snapshot(self.workspace)
+        self._drop_chat_files()
+        wants = user_wants_edits(user_text)
+        self._apply_edits = wants
+        self._named_files = filenames_in_text(user_text)
+        message = user_text if wants else (user_text + NO_EDIT_HINT)
         self.ui = TurnUI(emit, self.workspace, before)
+        self.ui.allow_edits = wants
+        self.ui.named_files = self._named_files
         self.io.ui = self.ui
         self.coder.io = self.io
         self.ui.start(self.coder.main_model.name)
-        for rel in self.coder.get_inchat_relative_files():
-            self.ui.read_file(rel, reason="in context")
         try:
-            self.coder.run(with_message=user_text, preproc=True)
+            self.coder.run(with_message=message, preproc=True)
         except Exception as exc:
             self.ui.finish_aider(str(exc)[:120])
             raise
@@ -522,9 +599,8 @@ class SessionAider:
         for rel in before:
             if rel not in after:
                 changed.add(rel)
-        for rel in changed:
-            if ("write:" + rel) not in self.ui.cards:
-                self.ui.write_done(rel, after)
+        for rel in sorted(changed):
+            self.ui.write_done(rel, after)
         if not text:
             if changed:
                 text = "Applied edits to " + ", ".join(sorted(changed)) + "."
