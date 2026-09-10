@@ -562,10 +562,7 @@ class SessionAider:
         self.coder.io = self.io
         if LIST_RE.search(user_text):
             self.ui.list_workspace()
-        try:
-            self.coder.run(with_message=message, preproc=True)
-        except Exception:
-            raise
+        self.coder.run(with_message=message, preproc=True)
         text = self.ui.prose or parse_stream_files(self.coder.partial_response_content or "")[0]
         after = snapshot(self.workspace)
         changed = set()
